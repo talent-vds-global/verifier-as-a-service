@@ -1,0 +1,56 @@
+# F1 — Nạp tiền ví qua đối tác: KỊCH BẢN mà verifier tự bắn vào hệ đang chạy.
+#
+# Mapping (`mapping/F1.yaml`) trả lời "muốn tin bước đó chạy thật thì phải thấy span nào";
+# file này trả lời "bắn request nào để hệ đi vào từng nhánh". Mỗi scenario nêu nhánh mong đợi
+# (mã `outcome.branches.*.code` trong mapping) — trace về mà ra nhánh khác thì tiêu chí của
+# nhánh đó là UNKNOWN chứ không được tính là đạt.
+#
+# Request lấy từ `ewallet-demo/scripts/demo-flows.sh` và acceptance criteria §1.9 của spec F1.
+# Mỗi request được driver gắn `traceparent` tự sinh + `X-Idempotency-Key` mới.
+#
+# Chạy:  python -m verifier.driver F1 [--trials 3] [--scenario F1.held]
+
+flow: F1
+version: 1
+trials: 3
+
+# Chuẩn bị môi trường trước MỖI lượt verify (không phải mỗi trial).
+# Nhánh HELD cộng 25.000.000đ vào daily_usage của CUST-003; ba trial là 75tr, nên lượt verify thứ
+# hai trong ngày sẽ chạm hạn mức ngày và ra 422 LIMIT_EXCEEDED thay vì 202 HELD. Xoá mức dùng
+# hôm nay của khách thử nghiệm để mỗi lượt bắt đầu như nhau. Đây là dữ liệu test, không đụng code.
+setup:
+  - db: paymentdb
+    sql: >-
+      DELETE FROM daily_usage
+      WHERE customer_id IN ('CUST-001', 'CUST-003') AND usage_date = CURRENT_DATE
+
+scenarios:
+  F1.happy:
+    branch: COMPLETED
+    label: Nạp 500.000đ qua VNPAY — đủ 4 bước saga
+    spec_ref: "§1.9 Nap tien thanh cong qua VNPAY"
+    request:
+      method: POST
+      path: /api/wallet/topup
+      body: {customerId: CUST-001, amount: 500000, currency: VND,
+             partnerCode: VNPAY, partnerAccountRef: "9704000000001234"}
+
+  F1.held:
+    branch: HELD
+    label: Nạp 25.000.000đ — vượt ngưỡng rà soát, giữ tiền chờ duyệt
+    spec_ref: "§1.6 A7 · §1.9 Nap tien vuot nguong ra soat thi bi treo"
+    request:
+      method: POST
+      path: /api/wallet/topup
+      body: {customerId: CUST-003, amount: 25000000, currency: VND,
+             partnerCode: VNPAY, partnerAccountRef: "9704000000009999"}
+
+  F1.rejected:
+    branch: REJECTED
+    label: Nạp 5.000đ — dưới mức tối thiểu, business từ chối
+    spec_ref: "§1.6 A5 · R-AMOUNT-01"
+    request:
+      method: POST
+      path: /api/wallet/topup
+      body: {customerId: CUST-001, amount: 5000, currency: VND,
+             partnerCode: VNPAY, partnerAccountRef: "9704000000001234"}

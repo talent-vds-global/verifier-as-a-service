@@ -302,6 +302,11 @@ def _detect_branch(spans: list, mapping: dict) -> dict:
     }
 
 
+def detect_branch(spans: list, mapping: dict) -> dict:
+    """Nhánh nghiệp vụ của một trace (code, label, status_code...) — bản công khai cho verifier."""
+    return {k: v for k, v in _detect_branch(spans, mapping).items() if k != "expect_extra"}
+
+
 # ==========================================================================
 # Đoạn của flow (segment)
 # ==========================================================================

@@ -124,6 +124,10 @@ nfr:
       http: {peer: partner-sim}
   NFR-ERR-01:
     metric: error_rate_in_trace
+    # Mã 4xx ở đây là kết cục nghiệp vụ đã khai trong §1.6 (A1, A3–A6), không phải lỗi hệ thống.
+    # Không loại ra thì trace từ chối ĐÚNG LUẬT (vd 422 AMOUNT_TOO_SMALL) bị tính error_rate ~50%
+    # và verifier báo FAIL giả ở nhánh REJECTED. 502/504 (A8) vẫn được tính.
+    ignore_status: [400, 409, 422]
 
 # --- 23 bước của §2.3 ---
 steps:

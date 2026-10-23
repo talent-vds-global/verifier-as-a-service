@@ -64,6 +64,26 @@ DB_QUALITY_URLS = _parse_pairs(os.getenv("DB_QUALITY_URLS", "")) or {
 # Thư mục chứa file ánh xạ bước tài liệu -> span runtime (mapping/<flow>.yaml)
 MAPPING_DIR = os.getenv("MAPPING_DIR", os.path.join(os.path.dirname(__file__), "mapping"))
 
+# ---------- Verifier (verifier/) ----------
+# Hệ được kiểm: verifier tự bắn kịch bản vào đây (cửa vào là gateway của ewallet-demo).
+VERIFY_TARGET_URL = os.getenv("VERIFY_TARGET_URL", "http://localhost:18080").rstrip("/")
+# DSN PostgreSQL của hệ được kiểm, dùng cho bước `setup` của kịch bản (reset dữ liệu test).
+# `{db}` được thay bằng tên database khai trong kịch bản.
+VERIFY_TARGET_DB_DSN = os.getenv(
+    "VERIFY_TARGET_DB_DSN", "postgresql://ewallet:ewallet@localhost:5432/{db}")
+# Kịch bản theo flow (scenarios/<flow>.yaml) và nơi ghi kết quả từng lượt verify.
+SCENARIO_DIR = os.getenv("SCENARIO_DIR", os.path.join(os.path.dirname(__file__), "scenarios"))
+VERIFY_RUNS_DIR = os.getenv("VERIFY_RUNS_DIR", os.path.join(os.path.dirname(__file__), "verifier", "runs"))
+# Chờ trace về Jaeger: thăm dò mỗi POLL giây, dừng khi số span không đổi trong SETTLE giây
+# (lớn hơn chu kỳ đẩy lô 5 giây của OTel; đuôi bất đồng bộ F1 bước 21–23 về sau phản hồi HTTP)
+# hoặc quá TIMEOUT giây.
+VERIFY_TRACE_POLL_SECONDS = float(os.getenv("VERIFY_TRACE_POLL_SECONDS", "2"))
+VERIFY_TRACE_SETTLE_SECONDS = float(os.getenv("VERIFY_TRACE_SETTLE_SECONDS", "8"))
+VERIFY_TRACE_TIMEOUT_SECONDS = float(os.getenv("VERIFY_TRACE_TIMEOUT_SECONDS", "60"))
+# Thời gian chờ phản hồi HTTP của một request kịch bản. Service Java vừa khởi động (JIT nguội)
+# có thể trả request đầu tiên rất chậm.
+VERIFY_REQUEST_TIMEOUT_SECONDS = float(os.getenv("VERIFY_REQUEST_TIMEOUT_SECONDS", "60"))
+
 
 def _flag(name: str, default: bool) -> bool:
     raw = os.getenv(name)

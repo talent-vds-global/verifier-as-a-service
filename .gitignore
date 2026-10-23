@@ -9,3 +9,6 @@ pycache/
 # Virtual environments
 venv/
 .venv/
+
+# Kết quả các lượt verify chạy từ CLI
+verifier/runs/
