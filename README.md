@@ -1,4 +1,52 @@
-# agent-review
+# verifier-as-a-service
+
+Verifier độc lập cho vòng lặp của AI coding agent: agent (Claude Code) code xong thì gọi verifier;
+verifier **tự bắn kịch bản** vào hệ đang chạy, lấy **đúng trace của lượt đó** (traceparent tự sinh),
+chấm theo **hợp đồng nghiệm thu** rút từ spec Confluence, trả `PASS` / `PASS_WITH_WARNINGS` / `FAIL` /
+`UNKNOWN` kèm bằng chứng. Verdict tất định, LLM không chạm vào. Kế hoạch:
+[`../docs/verifier-plan.md`](../docs/verifier-plan.md).
+
+Khởi tạo từ bản sao `agent-review` @ 73588d5; phần từ mục "agent-review (kế thừa)" trở xuống là tài
+liệu của phần lõi kế thừa.
+
+## Chạy verifier
+
+Cần stack `ewallet-demo` (`docker compose --profile all up -d`) và PostgreSQL `pg-context` (cổng 5433).
+
+```bash
+docker start pg-context
+PORT=8100 SCHEDULER_ENABLED=false python app.py      # REST /api/verify/*
+python -m verifier.run F1                            # hoặc chạy một lượt từ dòng lệnh
+python test_verifier.py                              # kiểm offline, không cần Jaeger
+python test_mcp.py --quick                           # kiểm MCP server đầu-cuối
+```
+
+## Nối phiên Claude Code (generator) vào verifier
+
+Chép `.mcp.json.example` thành `.mcp.json` ở thư mục mà phiên Claude Code làm việc (vd `ewallet-demo`),
+sửa hai đường dẫn tuyệt đối, hoặc:
+
+```bash
+claude mcp add verifier --env VERIFIER_URL=http://localhost:8100 -- D:/ViettelDigitalTalent/v-quality/verifier-as-a-service/venv/Scripts/python.exe D:/ViettelDigitalTalent/v-quality/verifier-as-a-service/mcp_server.py
+```
+
+| Tool | Việc |
+|---|---|
+| `list_contracts` | Xem tiêu chí của flow trước khi code; ghi lại `contract_sha256` |
+| `request_verification` | Xin verify hệ đang chạy; trả `verification_id` (~30 giây/lượt) |
+| `get_verification_result` | Verdict + tiêu chí trượt (tự chờ tối đa 90 giây) |
+| `get_evidence` | Trace, log, link Jaeger của một tiêu chí |
+
+| REST | |
+|---|---|
+| `GET /api/verify/contracts[/<flow>]?format=concise\|detailed` | hợp đồng |
+| `POST /api/verify` `{contract_id, expected_sha256?, scenarios?, trials?, note?}` | xếp hàng, trả 202 |
+| `GET /api/verify[?flow_id=]` · `GET /api/verify/<id>?format=concise\|detailed\|markdown\|raw` | kết quả |
+| `GET /api/verify/<id>/criteria/<criterion>` | bằng chứng một tiêu chí |
+
+---
+
+# agent-review (kế thừa)
 
 AI Agent kiểm tra chất lượng phần mềm: đối chiếu **hành vi runtime** (trace OpenTelemetry) và **code
 diff** với **tài liệu nghiệp vụ trên Confluence**, rồi kết luận `PASS` / `WARN`.

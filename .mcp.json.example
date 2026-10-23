@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "verifier": {
+      "command": "D:/ViettelDigitalTalent/v-quality/verifier-as-a-service/venv/Scripts/python.exe",
+      "args": ["D:/ViettelDigitalTalent/v-quality/verifier-as-a-service/mcp_server.py"],
+      "env": {
+        "VERIFIER_URL": "http://localhost:8100"
+      }
+    }
+  }
+}
