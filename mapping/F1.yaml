@@ -81,6 +81,33 @@ outcome:
       label: Vi phạm business rule — business từ chối ở S2
       doc_ref: "§2.4 A4/A5/A6"
       stop_after_step: 7
+      # Bước 7 ở nhánh này: business vẫn kiểm (ví, hạn mức) và ghi giao dịch REJECTED, nhưng theo
+      # §1.6 A4–A6 thì KHÔNG ghi ledger và không cộng hạn mức ngày. Hai matcher cuối là mệnh đề
+      # phủ định (min_count 0 + max_count 0): có dấu vết là sai spec.
+      step_overrides:
+        "7":
+          evidence:
+            - service: ewallet-payment-business
+              kind: server
+              grpc: {method: AuthorizePayment}
+              label: gRPC AuthorizePayment (phía xử lý)
+            - service: ewallet-payment-business
+              db: {op: SELECT, table: accounts}
+              label: SELECT accounts (R-ACCOUNT)
+            - service: ewallet-payment-business
+              db: {op: INSERT, table: payment_transactions}
+              label: INSERT payment_transactions (REJECTED)
+            - service: ewallet-payment-business
+              db: {op: INSERT, table: ledger_entries}
+              min_count: 0
+              max_count: 0
+              label: KHÔNG ghi ledger_entries (§1.6 A6)
+            - service: ewallet-payment-business
+              db: {op: INSERT, table: daily_usage}
+              min_count: 0
+              max_count: 0
+              label: KHÔNG cộng daily_usage
+          note: Nhánh từ chối — kiểm rồi dừng, không đụng tới tiền.
       expect_extra:
         - id: A4.1
           label: Business publish event PaymentFailed

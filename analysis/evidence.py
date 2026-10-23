@@ -272,7 +272,7 @@ def _detect_branch(spans: list, mapping: dict) -> dict:
     """
     cfg = (mapping or {}).get("outcome") or {}
     default = {"code": "UNKNOWN", "label": "Không xác định được nhánh", "stop_after_step": None,
-               "doc_ref": "", "status_code": None, "expect_extra": []}
+               "doc_ref": "", "status_code": None, "expect_extra": [], "step_overrides": {}}
     matchers = cfg.get("from")
     if not matchers:
         return default
@@ -299,12 +299,16 @@ def _detect_branch(spans: list, mapping: dict) -> dict:
         "doc_ref": branch.get("doc_ref", ""),
         "status_code": status,
         "expect_extra": branch.get("expect_extra") or [],
+        # Bước có mặt ở nhánh này nhưng dấu vết khác nhánh chính (vd REJECTED: bước 7 kiểm rồi
+        # từ chối nên KHÔNG ghi ledger) — ghi đè cấu hình bước của `steps` khi trace ra nhánh này.
+        "step_overrides": {str(k): v for k, v in (branch.get("step_overrides") or {}).items()},
     }
 
 
 def detect_branch(spans: list, mapping: dict) -> dict:
     """Nhánh nghiệp vụ của một trace (code, label, status_code...) — bản công khai cho verifier."""
-    return {k: v for k, v in _detect_branch(spans, mapping).items() if k != "expect_extra"}
+    return {k: v for k, v in _detect_branch(spans, mapping).items()
+            if k not in ("expect_extra", "step_overrides")}
 
 
 # ==========================================================================
@@ -421,6 +425,8 @@ def build_evidence(spec: dict, spans: list, trace_id: str = "", mapping: dict = 
     for step in spec.get("steps", []):
         no = str(step.get("no", ""))
         cfg = step_cfg.get(no) or step_cfg.get(int(no) if no.isdigit() else no) or {}
+        if no in branch.get("step_overrides", {}):
+            cfg = dict(cfg, **branch["step_overrides"][no])
         severity = cfg.get("severity", "must")
         note = cfg.get("note", "")
 
@@ -654,7 +660,7 @@ def build_evidence(spec: dict, spans: list, trace_id: str = "", mapping: dict = 
         },
         "mapping_source": mapping_source,
         # Không trả kèm `expect_extra` (cấu hình matcher thô) — các bước đó đã nằm trong `steps`
-        "branch": {k: v for k, v in branch.items() if k != "expect_extra"},
+        "branch": {k: v for k, v in branch.items() if k not in ("expect_extra", "step_overrides")},
         # Đoạn của flow mà trace này thể hiện (None nếu flow chỉ có một đoạn)
         "segment": ({"id": segment["id"], "label": segment["label"],
                      "steps": sorted(segment["steps"], key=lambda x: (len(x), x))}

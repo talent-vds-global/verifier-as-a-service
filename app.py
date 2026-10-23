@@ -24,6 +24,10 @@ from agent.core import run_agent
 from agent.prompt import PROMPT_PRE_MERGE
 from triggers import jobs, scheduler, store as trigger_store
 from triggers.confluence_watch import check_pages, flow_of_page
+from verifier import store as verify_store
+from verifier.contracts import ContractError, build_contract, public_view as contract_public_view
+from verifier.feedback import build_feedback, to_markdown as feedback_markdown
+from verifier.run import submit_verification
 
 # Console Windows mặc định là cp1252/cp437: một dòng print tiếng Việt (vd "[Jaeger] Lỗi khi lấy
 # trace...") ném UnicodeEncodeError giữa request và biến lỗi 404 bình thường thành 500.
@@ -412,6 +416,100 @@ def confluence_webhook():
     return jsonify({"status": "unchanged", "flow_id": flow_id, **result}), 200
 
 
+# ========== Verifier (verifier/) — giao diện cho AI coding agent ==========
+
+def _flows_with_scenarios() -> list:
+    names = sorted(os.listdir(config.SCENARIO_DIR)) if os.path.isdir(config.SCENARIO_DIR) else []
+    return [n[:-5] for n in names if n.endswith(".yaml")]
+
+
+@app.route("/api/verify/contracts", methods=["GET"])
+def verify_contracts():
+    """Các hợp đồng có sẵn — "xong nghĩa là gì" của từng flow, xem TRƯỚC khi code.
+    `?format=detailed` trả đủ tiêu chí; mặc định chỉ id + nhãn + cứng/mềm."""
+    detailed = request.args.get("format") == "detailed"
+    out, errors = [], []
+    for flow_id in _flows_with_scenarios():
+        try:
+            contract = build_contract(flow_id)
+            verify_store.remember_contract(contract)
+            out.append(contract_public_view(contract, detailed=detailed))
+        except ContractError as e:
+            errors.append({"contract_id": flow_id, "error": str(e)})
+    return jsonify({"contracts": out, "errors": errors})
+
+
+@app.route("/api/verify/contracts/<flow_id>", methods=["GET"])
+def verify_contract(flow_id):
+    try:
+        contract = build_contract(flow_id.upper())
+    except ContractError as e:
+        return jsonify({"error": str(e), "available": _flows_with_scenarios()}), 404
+    verify_store.remember_contract(contract)
+    return jsonify(contract_public_view(contract, detailed=request.args.get("format") != "concise"))
+
+
+@app.route("/api/verify", methods=["POST"])
+def verify_request():
+    """Xếp hàng một lượt verify. Body: {contract_id, expected_sha256?, trials?, scenarios?, note?}.
+    Trả 202 + verification_id ngay; kết quả lấy ở GET /api/verify/<id>."""
+    payload = request.get_json(silent=True) or {}
+    flow_id = str(payload.get("contract_id") or payload.get("flow_id") or "").strip().upper()
+    if flow_id not in _flows_with_scenarios():
+        return jsonify({"error": f"Không có hợp đồng '{flow_id}'. Gọi GET /api/verify/contracts để xem danh sách.",
+                        "available": _flows_with_scenarios()}), 400
+    scenarios = payload.get("scenarios")
+    if isinstance(scenarios, str):
+        scenarios = [s.strip() for s in scenarios.split(",") if s.strip()]
+    vid = submit_verification(flow_id, expected_sha=payload.get("expected_sha256"),
+                              trials=payload.get("trials"), only=scenarios or None,
+                              note=str(payload.get("note") or ""))
+    return jsonify({"verification_id": vid, "status": "queued",
+                    "poll": f"/api/verify/{vid}"}), 202
+
+
+@app.route("/api/verify", methods=["GET"])
+def verify_list():
+    return jsonify(verify_store.list_verifications(request.args.get("flow_id"),
+                                                    int(request.args.get("limit", 20))))
+
+
+@app.route("/api/verify/<vid>", methods=["GET"])
+def verify_result(vid):
+    """Kết quả một lượt verify. `?format=concise` (mặc định) | `detailed` | `markdown` | `raw`."""
+    row = verify_store.get_verification(vid)
+    if not row:
+        return jsonify({"error": f"Không có lượt verify {vid}"}), 404
+    if row["status"] != "done":
+        return jsonify({k: row[k] for k in ("id", "flow_id", "status", "error", "created_at",
+                                            "started_at", "finished_at")})
+    fmt = request.args.get("format", "concise")
+    result = row["result"]
+    if fmt == "raw":
+        return jsonify(result)
+    fb = build_feedback(result, detailed=(fmt == "detailed"))
+    if fmt == "markdown":
+        return feedback_markdown(fb), 200, {"Content-Type": "text/markdown; charset=utf-8"}
+    return jsonify(fb)
+
+
+@app.route("/api/verify/<vid>/criteria/<criterion>", methods=["GET"])
+def verify_evidence(vid, criterion):
+    """Đào sâu một tiêu chí: mọi trial, bằng chứng span đã rút gọn, link Jaeger."""
+    row = verify_store.get_verification(vid)
+    if not row or row["status"] != "done":
+        return jsonify({"error": f"Lượt verify {vid} chưa xong hoặc không tồn tại"}), 404
+    crit = next((c for c in row["result"]["criteria"] if c["id"] == criterion), None)
+    if not crit:
+        return jsonify({"error": f"Không có tiêu chí {criterion}",
+                        "criteria": [c["id"] for c in row["result"]["criteria"]]}), 404
+    trials = {t["trace_id"]: t for t in row["result"]["trials"]}
+    for ft in crit.get("failing_trials", []):
+        ft["jaeger_url"] = f"{config.JAEGER_URL}/trace/{ft['trace_id']}"
+        ft["logs"] = ((trials.get(ft["trace_id"]) or {}).get("collected") or {}).get("logs")
+    return jsonify(crit)
+
+
 def _start_background() -> None:
     # Debug bật reloader: tiến trình cha chỉ canh file, tiến trình con mới chạy app. Chỉ bật
     # lịch ở tiến trình con, nếu không mọi trigger định kỳ bị bắn hai lần.
@@ -423,4 +521,4 @@ def _start_background() -> None:
 
 if __name__ == "__main__":
     _start_background()
-    app.run(host="0.0.0.0", port=8000, debug=config.FLASK_DEBUG)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=config.FLASK_DEBUG)

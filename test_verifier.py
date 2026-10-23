@@ -17,7 +17,9 @@ import sys
 from analysis.evidence import build_evidence, detect_branch, load_mapping
 from analysis.flow_detect import detect_flow
 from test_flow_detect import load_traces, normalize, trace_files
+from verifier import policy
 from verifier.collect import assess
+from verifier.contracts import build_contract
 from verifier.driver import load_scenarios, new_trace_context
 
 failures = []
@@ -89,6 +91,56 @@ def main() -> int:
         check(nfr["status"] == "PASS", f"trace 422 {tid[:8]}: error_rate {nfr['measured']}% → {nfr['status']}")
     else:
         print("  --   chưa có trace F1 nhánh REJECTED trong file")
+
+    print("luật verdict (policy.decide)")
+    def crit(status, hard=True):
+        return {"status": status, "hard": hard}
+    check(policy.decide([crit("PASS"), crit("FAIL")]) == "FAIL", "cứng FAIL → FAIL")
+    check(policy.decide([crit("PASS"), crit("UNKNOWN")]) == "UNKNOWN", "cứng UNKNOWN → UNKNOWN, không phải PASS")
+    check(policy.decide([crit("PASS"), crit("FAIL", hard=False)]) == "PASS_WITH_WARNINGS", "chỉ mềm FAIL → PASS_WITH_WARNINGS")
+    check(policy.decide([crit("PASS"), crit("UNKNOWN", hard=False)]) == "PASS", "mềm UNKNOWN không chặn")
+    check(policy.decide([crit("FAIL"), crit("UNKNOWN")]) == "FAIL", "FAIL thắng UNKNOWN")
+
+    print("hợp đồng + chấm trên trace thật (spec dựng offline từ mapping)")
+    spec = {"flow_id": "F1", "page_id": "offline", "properties": {"Flow Name": "F1 offline"},
+            "steps": [{"no": no, "description": f"bước {no}", "service": "", "rules": []}
+                      for no in mapping["steps"]],
+            "nfrs": [{"code": "NFR-LAT-01", "operator": "<", "threshold": "500", "unit": "ms"},
+                     {"code": "NFR-ERR-01", "operator": "<", "threshold": "1", "unit": "percent"}]}
+    contract = build_contract("F1", spec=spec, spec_version=0)
+    ids = {c["id"]: c for c in contract["criteria"]}
+    check(len(contract["sha256"]) == 64 and build_contract("F1", spec=spec, spec_version=0)["sha256"] == contract["sha256"],
+          "sha256 tất định")
+    spec2 = dict(spec, nfrs=spec["nfrs"][:1])
+    check(build_contract("F1", spec=spec2, spec_version=0)["sha256"] != contract["sha256"], "spec đổi → sha256 đổi")
+    check(ids["F1.A7.1"]["branches"] == ["HELD"], "A7.1 chỉ kiểm ở nhánh HELD")
+    check(ids["F1.S12"]["branches"] == ["COMPLETED"], "bước 12 chỉ có ở nhánh COMPLETED (HELD/REJECTED dừng ở 7)")
+    check(not ids["F1.S3"]["hard"] and not ids["F1.S3"]["observable"], "bước không quan sát được là mềm")
+
+    def graded(code):
+        tid, spans = by_branch[code]
+        trial = {"scenario": code, "trial": 1, "expected_branch": code, "trace_id": tid,
+                 "collected": assess(spans, "F1", code, mapping), "_spans": spans}
+        return {g["criterion"]: g for g in policy.grade_trial(contract, trial, mapping)}
+
+    if "HELD" in by_branch:
+        g = graded("HELD")
+        check(g["F1.A7.1"]["status"] == "FAIL", f"lỗi #2: HELD thiếu publish → FAIL ({g['F1.A7.1']['observed']})")
+        check(g["F1.NFR-LAT-01"]["status"] == "FAIL", f"lỗi #5: NFR-LAT-01 nhánh HELD → FAIL ({g['F1.NFR-LAT-01']['observed']})")
+        check("F1.S12" not in g, "HELD không bị chấm bước sau điểm dừng")
+    if "REJECTED" in by_branch:
+        g = graded("REJECTED")
+        check(g["F1.S7"]["status"] == "PASS", f"REJECTED bước 7 theo step_overrides (không ledger) → PASS ({g['F1.S7']['observed']})")
+        check(g["F1.NFR-ERR-01"]["status"] == "PASS", "REJECTED NFR-ERR-01 không FAIL giả")
+    if "COMPLETED" in by_branch:
+        g = graded("COMPLETED")
+        check(g["F1.S7"]["status"] == "PASS", "COMPLETED bước 7 vẫn đòi ledger + daily_usage và đạt")
+        wrong = {"scenario": "x", "trial": 1, "expected_branch": "HELD", "trace_id": by_branch["COMPLETED"][0],
+                 "collected": assess(by_branch["COMPLETED"][1], "F1", "HELD", mapping), "_spans": by_branch["COMPLETED"][1]}
+        rows = policy.grade_trial(contract, wrong, mapping)
+        check(rows and all(r["status"] == "UNKNOWN" for r in rows), "sai nhánh → mọi tiêu chí của nhánh mong đợi UNKNOWN")
+        agg = {c["id"]: c for c in policy.aggregate(contract, rows)}
+        check(agg["F1.A7.1"]["status"] == "UNKNOWN", "gộp: chỉ có UNKNOWN thì không thành PASS")
 
     print(f"\n{'XONG' if not failures else str(len(failures)) + ' lỗi'}")
     return 1 if failures else 0

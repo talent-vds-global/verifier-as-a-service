@@ -48,3 +48,32 @@ CREATE TABLE IF NOT EXISTS spec_versions (
     checked_at TIMESTAMPTZ DEFAULT NOW(),
     changed_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ========== Verifier (verifier/) ==========
+-- Mỗi phiên bản hợp đồng đã từng phát cho agent: (flow, sha256) -> nội dung. Sha256 đổi nghĩa là
+-- spec Confluence, mapping hoặc kịch bản đã đổi.
+CREATE TABLE IF NOT EXISTS contracts (
+    flow_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    body JSONB NOT NULL,
+    first_seen TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (flow_id, sha256)
+);
+
+-- Một lượt verify: chạy kịch bản -> thu trace -> chấm -> verdict + phản hồi cho agent.
+CREATE TABLE IF NOT EXISTS verifications (
+    id TEXT PRIMARY KEY,                 -- v-20261023-191802-ab12
+    flow_id TEXT NOT NULL,
+    status TEXT NOT NULL,                -- queued / running / done / error
+    verdict TEXT,                        -- PASS / PASS_WITH_WARNINGS / FAIL / UNKNOWN
+    contract_sha256 TEXT,
+    expected_sha256 TEXT,                -- sha256 agent đã xem khi bắt đầu code (nếu gửi kèm)
+    contract_changed BOOLEAN DEFAULT FALSE,
+    note TEXT,                           -- ghi chú của người gọi, vd commit
+    result JSONB,                        -- tiêu chí + trial + phản hồi
+    error TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_verifications_flow_time ON verifications (flow_id, created_at DESC);
