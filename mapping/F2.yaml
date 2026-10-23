@@ -1,0 +1,405 @@
+# F2 — Thanh toán hoá đơn và nạp tiền điện thoại: ánh xạ BƯỚC TRONG TÀI LIỆU -> DẤU VẾT TRONG TRACE.
+#
+# Mỗi khoá dưới `steps` là số thứ tự bước ở bảng §2.3 của trang Confluence
+# "[F2] Thanh toán hoá đơn và nạp tiền điện thoại". File này KHÔNG mô tả lại nghiệp vụ.
+# Cú pháp matcher: xem chú thích đầu file mapping/F1.yaml.
+#
+# ĐIỂM KHÁC F1 — flow này trải trên NHIỀU LẦN GỌI HTTP, tức nhiều trace:
+#   bước 1–6  = tra cứu hoá đơn (GET /api/wallet/bill)
+#   bước 7–14 = thanh toán (POST /api/wallet/bill/pay), hoặc biến thể TELCO
+#               (POST /api/wallet/telco/topup) vốn bỏ hẳn bước 1–6 theo §2.3.
+# Khối `segments` nói rõ trace đang xem là đoạn nào; bước của đoạn kia là NOT_IN_BRANCH
+# chứ không phải MISSING — nếu không, mọi trace thanh toán đều bị báo thiếu 6 bước.
+#
+# Kiểm bằng:  python -m analysis.check_mapping F2 <trace_id>
+
+flow: F2
+version: 1
+title: Thanh toán hoá đơn và nạp tiền điện thoại
+doc_section: "§2.3 Mô tả chi tiết nghiệp vụ"
+
+segments:
+  - id: telco
+    label: Nạp tiền điện thoại (biến thể TELCO)
+    when:
+      - {service: ewallet-business-customer-mobileapp, kind: server, http: {route: /api/wallet/telco/topup}}
+    steps: ["7", "8", "9", "10", "11", "12", "13", "14"]
+    note: "§2.3: biến thể TELCO bỏ bước 1–6 (không tra cứu hoá đơn), phí bằng 0."
+
+  - id: pay
+    label: Thanh toán hoá đơn
+    when:
+      - {service: ewallet-business-customer-mobileapp, kind: server, http: {route: /api/wallet/bill/pay}}
+    steps: ["7", "8", "9", "10", "11", "12", "13", "14"]
+    note: Bước tra cứu hoá đơn (1–6) là một lần gọi HTTP riêng nên nằm ở trace khác.
+
+  - id: inquiry
+    label: Tra cứu hoá đơn (S0)
+    when:
+      - {service: ewallet-business-customer-mobileapp, kind: server, http: {route: /api/wallet/bill}}
+      - {service: ewallet-payment-order, kind: server, http: {route: /api/orders/bill-inquiry}}
+    steps: ["1", "2", "3", "4", "5", "6"]
+    note: Bước thanh toán (7–14) là một lần gọi HTTP riêng nên nằm ở trace khác.
+
+# --- Nhánh nghiệp vụ theo §2.4 ---
+# Hai cửa vào: trace thanh toán lấy mã của POST /api/orders, trace tra cứu lấy mã của
+# GET /api/orders/bill-inquiry (B1/B2 kết thúc ngay ở S0, chưa có đơn nào).
+outcome:
+  from:
+    - service: ewallet-payment-order
+      kind: server
+      http: {route: /api/orders}
+    - service: ewallet-payment-order
+      kind: server
+      http: {route: /api/orders/bill-inquiry}
+  branches:
+    "200":
+      code: COMPLETED
+      label: Thanh toán thành công (hoặc tra cứu thấy hoá đơn)
+    "202":
+      code: HELD
+      label: Vượt ngưỡng rà soát, giữ tiền chờ duyệt — saga dừng ở S2
+      doc_ref: "§2.4 B6"
+      stop_after_step: 10
+      expect_extra:
+        - id: B6.1
+          label: Business publish event PaymentHeld lên ewallet.payment.events
+          doc_ref: "§2.4 B6 + R-EVENT-01"
+          service: ewallet-payment-business
+          rules: [R-REVIEW-01, R-EVENT-01]
+          evidence:
+            - service: ewallet-payment-business
+              kafka: {topic: ewallet.payment.events, operation: publish}
+              label: Kafka publish ewallet.payment.events
+    "404":
+      code: BILL_NOT_FOUND
+      label: Không tìm thấy hoá đơn — dừng ở S0, không tạo đơn
+      doc_ref: "§2.4 B1"
+    "409":
+      code: BILL_ALREADY_PAID_OR_DUPLICATE
+      label: Hoá đơn đã thanh toán (B2) hoặc trùng idempotency key với payload khác (R-IDEM-03)
+      doc_ref: "§2.4 B2"
+      stop_after_step: 8
+    "422":
+      code: REJECTED
+      label: Vi phạm business rule — business từ chối ở S2, chưa giữ tiền
+      doc_ref: "§2.4 B3/B4/B5"
+      # Dừng ở 9 chứ không phải 10: bước 10 mô tả việc GHI SỔ GIỮ TIỀN, mà nhánh từ chối
+      # không đi tới đó. Yêu cầu thật của nhánh này nằm ở expect_extra dưới đây.
+      stop_after_step: 9
+      expect_extra:
+        - id: B4.1
+          label: Business ghi transaction REJECTED và KHÔNG ghi bút toán nào
+          doc_ref: "§2.4 B3/B4/B5"
+          service: ewallet-payment-business
+          rules: [R-BALANCE-01, R-LEDGER-01]
+          evidence:
+            - service: ewallet-payment-business
+              db: {op: INSERT, table: payment_transactions}
+              label: INSERT payment_transactions (trạng thái REJECTED)
+            - service: ewallet-payment-business
+              db: {op: INSERT, table: ledger_entries}
+              min_count: 0
+              max_count: 0
+              label: Không được có dòng ledger_entries nào
+        - id: B4.2
+          label: Business publish event PaymentFailed
+          doc_ref: "§2.4 B4 + R-EVENT-01"
+          service: ewallet-payment-business
+          rules: [R-EVENT-01]
+          evidence:
+            - service: ewallet-payment-business
+              kafka: {topic: ewallet.payment.events, operation: publish}
+              label: Kafka publish ewallet.payment.events
+    "502":
+      code: PARTNER_DECLINED
+      label: Đối tác từ chối ở S3 — vào nhánh bù trừ F4
+      doc_ref: "§2.4 B7"
+      stop_after_step: 11
+    "504":
+      code: PARTNER_TIMEOUT
+      label: Đối tác không phản hồi ở S3 — vào nhánh bù trừ F4
+      doc_ref: "§2.4 B7"
+      stop_after_step: 11
+
+# --- Điểm đo NFR (§4) ---
+nfr:
+  NFR-LAT-01:
+    point: Span gRPC AuthorizePayment phía ewallet-payment-business
+    measure:
+      service: ewallet-payment-business
+      kind: server
+      grpc: {method: AuthorizePayment}
+  NFR-LAT-02:
+    point: End-to-end tại ewallet-gateway cho POST /api/wallet/bill/pay (chỉ có ở trace thanh toán)
+    measure:
+      service: ewallet-gateway
+      kind: server
+      http: {method: POST, path: /api/wallet/bill/pay}
+  NFR-LAT-06:
+    point: End-to-end tại ewallet-gateway cho GET /api/wallet/bill (chỉ có ở trace tra cứu)
+    measure:
+      service: ewallet-gateway
+      kind: server
+      http: {method: GET, path: /api/wallet/bill}
+  NFR-TIMEOUT-01:
+    point: Lời gọi HTTP từ ewallet-third-party sang partner-sim
+    measure:
+      service: ewallet-third-party
+      kind: client
+      http: {peer: partner-sim}
+
+# --- 14 bước của §2.3 ---
+steps:
+  "1":
+    evidence:
+      - service: ewallet-gateway
+        kind: server
+        http: {method: GET, path: /api/wallet/bill}
+        label: HTTP GET /api/wallet/bill tại gateway
+    note: partnerCode và billCode nằm ở query string; OTel không ghi query nên chỉ chứng minh được lời gọi.
+
+  "2":
+    evidence:
+      - service: ewallet-business-customer-mobileapp
+        kind: client
+        http: {peer: ewallet-payment-order}
+        label: BFF gọi tiếp sang payment-order
+      - service: ewallet-payment-order
+        kind: server
+        http: {method: GET, route: /api/orders/bill-inquiry}
+        label: HTTP GET /api/orders/bill-inquiry tới payment-order
+
+  "3":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: InquireBill}
+        label: gRPC InquireBill (phía gọi)
+      - service: ewallet-payment-business
+        kind: server
+        grpc: {method: InquireBill}
+        label: gRPC InquireBill (phía xử lý)
+
+  "4":
+    evidence:
+      - service: ewallet-payment-business
+        kind: client
+        http: {peer: ewallet-third-party}
+        label: Business gọi POST /api/thirdparty/bill-inquiry
+      - service: ewallet-third-party
+        kind: server
+        http: {method: POST, route: /api/thirdparty/bill-inquiry}
+        label: third-party nhận yêu cầu tra cứu
+
+  "5":
+    evidence:
+      - service: ewallet-third-party
+        db: {op: SELECT, table: partner_config}
+        label: SELECT partner_config (R-BILL-03 — đối tác phải enabled)
+      - service: ewallet-third-party
+        kind: client
+        http: {peer: partner-sim}
+        label: HTTP POST sang partner-sim
+      - service: partner-sim
+        kind: server
+        http: {method: POST, route: "/partner/{code}/bill-inquiry"}
+        label: partner-sim xử lý tra cứu hoá đơn
+
+  "6":
+    evidence:
+      - service: ewallet-business-customer-mobileapp
+        kind: server
+        http: {route: /api/wallet/bill}
+        label: BFF trả kết quả tra cứu cho client
+      - service: ewallet-payment-order
+        db: {op: INSERT}
+        min_count: 0
+        max_count: 0
+        label: Không được ghi bảng nghiệp vụ nào ở payment-order
+      - service: ewallet-payment-business
+        db: {op: INSERT}
+        min_count: 0
+        max_count: 0
+        label: Không được ghi bảng nghiệp vụ nào ở payment-business
+    note: >-
+      Hai matcher "tối đa 0 lần" là cách chứng minh mệnh đề phủ định của tài liệu ("không ghi DB
+      nghiệp vụ"): có dấu vết mới là sai. Vượt trần thì bước thành PARTIAL, không phải MISSING.
+
+  "7":
+    require: any
+    evidence:
+      - service: ewallet-gateway
+        kind: server
+        http: {method: POST, path: /api/wallet/bill/pay}
+        label: HTTP POST /api/wallet/bill/pay tại gateway
+      - service: ewallet-gateway
+        kind: server
+        http: {method: POST, path: /api/wallet/telco/topup}
+        label: HTTP POST /api/wallet/telco/topup tại gateway (biến thể TELCO)
+      - service: ewallet-business-customer-mobileapp
+        kind: server
+        http: {route: /api/wallet/bill/pay}
+        optional: true
+        label: BFF nhận yêu cầu thanh toán hoá đơn
+      - service: ewallet-business-customer-mobileapp
+        kind: server
+        http: {route: /api/wallet/telco/topup}
+        optional: true
+        label: BFF nhận yêu cầu nạp telco
+    note: >-
+      require=any vì hai biến thể dùng hai endpoint khác nhau. Header X-Idempotency-Key (R-IDEM-01)
+      không được OTel ghi lại nên chỉ chứng minh được lời gọi, không chứng minh được header.
+
+  "8":
+    evidence:
+      - service: ewallet-payment-order
+        kind: server
+        http: {method: POST, route: /api/orders}
+        label: HTTP POST /api/orders tới payment-order
+      - service: ewallet-payment-order
+        db: {op: SELECT, table: payment_orders}
+        label: SELECT payment_orders (kiểm tra idempotency — R-IDEM-02)
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: payment_orders}
+        label: INSERT payment_orders (trạng thái CREATED)
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: order_steps}
+        label: INSERT order_steps (ghi bước CREATE_ORDER)
+    note: Giá trị bill_code nằm trong tham số câu lệnh, không đọc được từ thuộc tính span.
+
+  "9":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: AuthorizePayment}
+        label: gRPC AuthorizePayment (phía gọi)
+      - service: ewallet-payment-order
+        db: {op: UPDATE, table: payment_orders}
+        label: UPDATE payment_orders sang AUTHORIZING
+    note: paymentType=BILL/TELCO nằm trong body gRPC, không có trong thuộc tính span.
+
+  "10":
+    evidence:
+      - service: ewallet-payment-business
+        kind: server
+        grpc: {method: AuthorizePayment}
+        label: gRPC AuthorizePayment (phía xử lý)
+      - service: ewallet-payment-business
+        db: {op: SELECT, table: fx_rates}
+        optional: true
+        label: SELECT fx_rates (R-CURRENCY-01 — chỉ chạy khi tiền tệ khác VND)
+      - service: ewallet-payment-business
+        db: {op: SELECT, table: accounts}
+        label: SELECT accounts (R-ACCOUNT)
+      - service: ewallet-payment-business
+        db: {op: SELECT, table: limit_config}
+        label: SELECT limit_config (R-LIMIT-01)
+      - service: ewallet-payment-business
+        db: {op: SELECT, table: account_balances}
+        label: SELECT account_balances (R-BALANCE-01 — số dư phải đủ cả phí)
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: payment_transactions}
+        label: INSERT payment_transactions
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: ledger_entries}
+        min_count: 2
+        label: INSERT bút toán ledger_entries PENDING (R-LEDGER-01)
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: daily_usage}
+        label: Cộng daily_usage (R-USAGE-01)
+    note: >-
+      Sàn 2 dòng ledger là mức chung cho cả hai biến thể: hoá đơn có phí nên đúng ra 4 dòng
+      (2 tiền gốc + 2 phí, R-FEE-02), nạp telco miễn phí nên đúng 2 dòng (R-FEE-03). Số tiền và
+      tỉ lệ phí nằm trong tham số câu lệnh nên không kiểm được từ trace.
+
+  "11":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: ExecutePartnerPayment}
+        label: gRPC ExecutePartnerPayment (phía gọi)
+      - service: ewallet-payment-business
+        kind: client
+        http: {peer: ewallet-third-party}
+        label: Business gọi POST /api/thirdparty/execute
+      - service: ewallet-third-party
+        db: {op: INSERT, table: partner_transactions}
+        label: INSERT partner_transactions PENDING
+      - service: ewallet-third-party
+        kind: client
+        http: {peer: partner-sim}
+        label: HTTP POST sang partner-sim (NFR-TIMEOUT-01 đo ở đây)
+      - service: partner-sim
+        kind: server
+        http: {method: POST, route: "/partner/{code}/execute"}
+        label: partner-sim xử lý giao dịch
+      - service: ewallet-third-party
+        db: {op: UPDATE, table: partner_transactions}
+        label: UPDATE partner_transactions = SUCCESS
+      - service: ewallet-third-party
+        ws: {frame: WATCH, operation: send}
+        optional: true
+        label: WebSocket gửi frame WATCH để chờ quyết toán
+
+  "12":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: ConfirmPayment}
+        label: gRPC ConfirmPayment (phía gọi)
+      - service: ewallet-payment-business
+        kind: server
+        grpc: {method: ConfirmPayment}
+        label: gRPC ConfirmPayment (phía xử lý)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: ledger_entries}
+        min_count: 2
+        label: UPDATE bút toán ledger sang POSTED (R-LEDGER-01)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: account_balances}
+        label: UPDATE account_balances (trừ tiền khỏi ví)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: payment_transactions}
+        label: UPDATE payment_transactions sang CAPTURED
+      - service: ewallet-payment-business
+        kafka: {topic: ewallet.payment.events, operation: publish}
+        label: Kafka publish ewallet.payment.events (R-EVENT-01)
+    note: Tên event (PaymentCompleted) không nằm trong thuộc tính span, chỉ thấy topic.
+
+  "13":
+    evidence:
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: order_steps}
+        label: INSERT order_steps (ghi bước CONFIRM)
+      - service: ewallet-payment-order
+        db: {op: UPDATE, table: payment_orders}
+        label: UPDATE payment_orders sang COMPLETED
+      - service: ewallet-payment-order
+        kind: server
+        http: {route: /api/orders, status: 200}
+        label: Trả HTTP 200 về BFF
+
+  "14":
+    severity: must
+    evidence:
+      - service: ewallet-notification
+        kafka: {topic: ewallet.payment.events, operation: process}
+        label: notification-cg nhận event
+      - service: ewallet-notification
+        db: {op: INSERT, table: notification_outbox}
+        label: INSERT notification_outbox (R-NOTIF-01)
+      - service: ewallet-payment-order
+        kafka: {topic: ewallet.payment.events, operation: process}
+        label: order-status-cg nhận event
+      - service: partner-sim
+        ws: {frame: SETTLEMENT, operation: send}
+        optional: true
+        label: partner-sim đẩy frame SETTLEMENT
+      - service: ewallet-third-party
+        ws: {frame: SETTLEMENT, operation: receive}
+        optional: true
+        label: WebSocket nhận frame SETTLEMENT từ đối tác
+    note: >-
+      Đuôi bất đồng bộ — client đã nhận phản hồi trước bước này. Frame SETTLEMENT tới trễ khoảng
+      300ms nên trace chụp sớm có thể chưa thấy; chi tiết đuôi này là nội dung của [F5].

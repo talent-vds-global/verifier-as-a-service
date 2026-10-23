@@ -1,0 +1,171 @@
+# F5 — Thông báo bất đồng bộ: ánh xạ BƯỚC TÀI LIỆU -> DẤU VẾT TRONG TRACE.
+#
+# Mỗi khoá dưới `steps` là số thứ tự bước ở bảng §2.4 của trang Confluence
+# "[F5] Thông báo bất đồng bộ". Cú pháp matcher: xem chú thích đầu mapping/F1.yaml.
+#
+# ĐẶC THÙ: F5 là ĐUÔI CHUNG của mọi giao dịch, không phải một request riêng. Span Kafka consumer
+# mang theo trace context của request gốc nên toàn bộ 9 bước nằm TRONG trace của F1/F2/F3/F4.
+# Vì vậy:
+#   - flow-map.yaml gắn F5 làm **nhãn phụ** cho những trace đó (variant `consume`);
+#   - muốn soi riêng đuôi thông báo thì chạy mapping này trên chính trace giao dịch:
+#         python -m analysis.check_mapping F5 <trace_id_cua_F1>
+#   - cửa vào riêng duy nhất của F5 là GET /api/notifications (khách đọc lại danh sách) —
+#     việc đó không nằm trong §2.4 nên có đoạn riêng, không bị báo thiếu 9 bước.
+#
+# Trace của giao dịch HELD KHÔNG khớp đoạn nào: không có span consumer (vì không có event nào được
+# publish) mà cũng không phải lời gọi đọc danh sách. Khi đó cả 9 bước đều được đối chiếu và đều
+# MISSING — đúng ý đồ, vì đó chính là dấu hiệu sự cố: R-EVENT-01 bắt buộc publish PaymentHeld.
+
+flow: F5
+version: 1
+title: Thông báo bất đồng bộ
+doc_section: "§2.4 Mô tả chi tiết nghiệp vụ"
+
+segments:
+  - id: consume
+    label: Đuôi bất đồng bộ của một giao dịch
+    when:
+      - {kind: consumer, kafka: {topic: ewallet.payment.events, operation: process}}
+    steps: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+  - id: read
+    label: Khách đọc lại danh sách thông báo
+    when:
+      - {service: ewallet-notification, kind: server, http: {route: /api/notifications}}
+    steps: []
+    note: >-
+      Lời gọi đọc danh sách thông báo (api-contracts §10.2) không nằm trong bảng §2.4 — bảng đó
+      mô tả đường đi của event, còn đây chỉ là truy vấn lại outbox đã ghi từ trước.
+
+# --- Nhánh nghiệp vụ: lấy theo kết cục của giao dịch sinh ra event ---
+outcome:
+  from:
+    service: ewallet-payment-order
+    kind: server
+    http: {route: /api/orders}
+  branches:
+    "200":
+      code: COMPLETED
+      label: Giao dịch hoàn tất — phải có PaymentCompleted đi hết đường ống
+    "202":
+      code: HELD
+      label: >-
+        Giao dịch bị treo chờ duyệt. R-EVENT-01 vẫn bắt buộc publish PaymentHeld, nên toàn bộ
+        đường ống thông báo PHẢI chạy; không có bước nào là dấu hiệu khách không được báo
+        (§2.5 D5).
+      doc_ref: "§2.5 D5"
+    "422":
+      code: REJECTED
+      label: Giao dịch bị từ chối — phải có PaymentFailed đi hết đường ống
+    "502":
+      code: REFUNDED
+      label: Đối tác từ chối, đã bù trừ — phải có PaymentRefunded đi hết đường ống
+    "504":
+      code: REFUNDED_TIMEOUT
+      label: Đối tác hết giờ, đã bù trừ — phải có PaymentRefunded đi hết đường ống
+
+# --- Điểm đo NFR (§4) ---
+nfr:
+  NFR-LAT-05:
+    point: Từ span publish event tới lúc ghi xong notification_sent_log
+    metric: elapsed_between
+    from: {service: ewallet-payment-business, kafka: {topic: ewallet.payment.events, operation: publish}}
+    from_edge: start
+    to: {service: ewallet-notification, db: {op: INSERT, table: notification_sent_log}}
+    to_edge: end
+  NFR-NOTIF-01:
+    point: >-
+      Tỉ lệ event rơi vào dead letter topic — số liệu cộng dồn nhiều trace, một trace đơn lẻ không
+      đo được. Dấu hiệu trong trace này là có span Kafka trên ewallet.payment.events.DLT; khi đó
+      flow-map gắn nhãn phụ "F5:dead-letter".
+  NFR-NOTIF-02:
+    point: >-
+      Consumer lag của notification-cg — số liệu của Kafka, không nằm trong trace. Cần lấy từ
+      metric của broker.
+
+# --- 9 bước của §2.4 ---
+steps:
+  "1":
+    evidence:
+      - service: ewallet-payment-business
+        kafka: {topic: ewallet.payment.events, operation: publish}
+        label: Kafka publish ewallet.payment.events (R-EVENT-01)
+    note: >-
+      Khoá message (orderId) và header eventType/x-attempt: x-attempt có trong thuộc tính span nhờ
+      cấu hình capture-headers của OTel; tên event thì không, chỉ thấy topic.
+
+  "2":
+    evidence:
+      - service: ewallet-notification
+        kafka: {topic: ewallet.payment.events, operation: process}
+        label: notification-cg nhận và xử lý message
+      - service: ewallet-notification
+        db: {op: SELECT, table: notification_outbox}
+        label: SELECT notification_outbox (kiểm tra eventId đã xử lý chưa — R-NOTIF-05)
+
+  "3":
+    observable: false
+    reason: >-
+      NotificationRouter chọn kênh trong bộ nhớ, không sinh span. Bằng chứng gián tiếp là số dòng
+      outbox được ghi ở bước 4: mỗi kênh một dòng.
+    anchor:
+      service: ewallet-notification
+      kafka: {topic: ewallet.payment.events, operation: process}
+      label: Span CONSUMER của notification-cg
+
+  "4":
+    evidence:
+      - service: ewallet-notification
+        db: {op: INSERT, table: notification_outbox}
+        label: INSERT notification_outbox — một dòng cho mỗi kênh (R-NOTIF-05)
+
+  "5":
+    evidence:
+      - service: ewallet-notification
+        db: {op: INSERT, table: notification_sent_log}
+        label: INSERT notification_sent_log (R-NOTIF-03)
+    note: >-
+      Trạng thái SENT / FAILED / DEAD_LETTER nằm trong tham số câu lệnh nên không đọc được từ
+      span. Việc gửi là giả lập nên không có lời gọi mạng ra ngoài.
+
+  "6":
+    evidence:
+      - service: ewallet-notification
+        db: {op: UPDATE, table: notification_outbox}
+        label: UPDATE notification_outbox sang SENT
+
+  "7":
+    observable: false
+    reason: >-
+      SseHub đẩy dữ liệu qua kết nối SSE đang mở, không sinh span mới. Nếu không có client nào
+      mở kết nối thì bước này không xảy ra mà vẫn đúng (§2.5 D1).
+    anchor:
+      service: ewallet-notification
+      db: {op: INSERT, table: notification_sent_log}
+      label: INSERT notification_sent_log — mốc ngay trước khi đẩy SSE
+
+  "8":
+    evidence:
+      - service: ewallet-payment-order
+        kafka: {topic: ewallet.payment.events, operation: process}
+        label: order-status-cg nhận cùng event (R-ORDST-01)
+    note: >-
+      Hai consumer group độc lập offset nên đây là span riêng, chạy song song với bước 2 — bên
+      này hỏng không chặn bên kia.
+
+  "9":
+    evidence:
+      - service: ewallet-payment-order
+        db: {op: SELECT, table: order_steps}
+        label: SELECT order_steps (kiểm tra event đã áp chưa — R-ORDST-02)
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: order_steps}
+        label: INSERT order_steps EVENT_APPLIED (R-ORDST-03)
+      - service: ewallet-payment-order
+        db: {op: UPDATE, table: payment_orders}
+        optional: true
+        label: UPDATE payment_orders — chỉ khi trạng thái mới hợp lệ (R-ORDST-02)
+    note: >-
+      R-ORDST-02 chỉ cho cập nhật khi trạng thái mới hợp lệ, nên KHÔNG có UPDATE cũng có thể là
+      đúng (event tới sau khi đơn đã ở trạng thái kết thúc — §2.5 D7). Vì vậy matcher đó optional,
+      còn dòng order_steps EVENT_APPLIED thì bắt buộc: nó là dấu vết event đã được xử lý.

@@ -1,0 +1,41 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: devpass
+      POSTGRES_DB: context
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Tự động chạy seed.sql lần đầu khởi tạo DB
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d context"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Trong mạng Docker, app gọi db bằng tên "db", không phải localhost
+      DB_HOST: db
+      DB_PORT: 5432
+      # Jaeger và dashboard db-quality chạy NGOÀI compose này (compose của ewallet-demo).
+      # Từ trong container, "localhost" là chính container -> phải trỏ ra host:
+      # JAEGER_URL: http://host.docker.internal:16686
+      # DB_QUALITY_URLS: ewallet-payment-order=http://host.docker.internal:19082,ewallet-payment-business=http://host.docker.internal:19083,ewallet-third-party=http://host.docker.internal:19084,ewallet-notification=http://host.docker.internal:19085
+    # Linux cần dòng này thì host.docker.internal mới phân giải được:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+volumes:
+  pgdata:

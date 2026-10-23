@@ -1,0 +1,112 @@
+# flow-map.yaml — TRACE NÀY THUỘC LUỒNG NGHIỆP VỤ NÀO?
+#
+# Trước file này, `flow_id` phải do người gọi truyền tay (mặc định "F1"), nên một trace F3 vẫn bị
+# đối chiếu với tài liệu F1 và báo thiếu hàng loạt bước. File này trả lời câu hỏi đó bằng **span
+# cửa vào** của trace: span kind=server bắt đầu sớm nhất, bỏ qua các service ở `entry.skip_services`.
+#
+# Nguồn: đồng bộ với `ewallet-demo/infra/v-quality/flow-map.yaml` (bản gốc của quyết định thiết kế),
+# viết lại theo cú pháp matcher của `analysis/evidence.py` để dùng chung một bộ so khớp span.
+#
+# Đã đo trên trace thật (traces.jsonl của ewallet-demo, 19.395 trace):
+#   - Span của ewallet-gateway có http.route = ID route ("wallet", "orders-internal") chứ không phải
+#     template đường dẫn -> KHÔNG phân loại ở gateway, phải bỏ qua nó.
+#   - 98% trace trong file là trace nền chỉ có span JDBC (db-quality-library quét định kỳ, poller
+#     outbox) -> không có span cửa vào, xếp loại "background", không thuộc flow nào.
+#   - Span Kafka CONSUMER nằm CÙNG trace với request gốc (context đi theo header) nên F5 chủ yếu
+#     xuất hiện dưới dạng **nhãn phụ** (overlay) của F1/F2/F3/F4, không phải flow chính.
+#
+# Kiểm bằng:  python test_flow_detect.py          (chạy trên file trace thật của ewallet-demo)
+
+version: 1
+system: ewallet-demo
+
+entry:
+  # Gateway chỉ chuyển tiếp: route của nó là ID cấu hình, không phải đường dẫn nghiệp vụ.
+  skip_services: [ewallet-gateway]
+  # Trace không có span server nào ngoài skip_services nhưng có consumer -> cửa vào là consumer.
+  consumer_as_entry: true
+
+ignore:
+  # Cửa vào khớp các mẫu này thì trace bị bỏ qua có chủ đích (không phải "chưa map").
+  routes:
+    - /actuator/*
+    - "*/ping"
+    - /api/trace-test
+    - /admin/*                    # màn hình Ops đọc số dư / hạn mức / bút toán, không phải flow khách hàng
+    - /api/notifications/stream   # SSE mở kết nối dài; sự kiện thật nằm trong trace của giao dịch
+    - /ws/*                       # bắt tay WebSocket lúc khởi động; bản tin WATCH/SETTLEMENT đã nằm trong trace F1/F2
+    - /v3/api-docs/*
+    - /swagger-ui/*
+
+flows:
+  - code: F1
+    slug: topup-partner
+    title: Nạp tiền ví qua đối tác
+    entries:
+      - service: ewallet-business-customer-mobileapp
+        http: {method: POST, route: /api/wallet/topup}
+
+  - code: F2
+    slug: bill-telco-payment
+    title: Thanh toán hoá đơn và nạp tiền điện thoại
+    entries:
+      - service: ewallet-business-customer-mobileapp
+        http: {method: GET, route: /api/wallet/bill}            # đoạn tra cứu (S0)
+      - service: ewallet-business-customer-mobileapp
+        http: {method: POST, route: /api/wallet/bill/pay}       # đoạn thanh toán hoá đơn
+      - service: ewallet-business-customer-mobileapp
+        http: {method: POST, route: /api/wallet/telco/topup}    # biến thể TELCO
+      - service: ewallet-payment-order
+        http: {method: GET, route: /api/orders/bill-inquiry}    # gọi thẳng order, không qua BFF
+
+  - code: F3
+    slug: p2p-transfer
+    title: Chuyển tiền P2P giữa hai ví
+    entries:
+      - service: ewallet-business-customer-mobileapp
+        http: {method: POST, route: /api/wallet/transfer}
+
+  - code: F4
+    slug: failure-refund
+    title: Giao dịch lỗi và hoàn tiền
+    entries:
+      # F4d — Ops chủ động hoàn tiền. F4a/F4c không có cửa vào riêng: chúng là nhánh bù trừ
+      # xảy ra BÊN TRONG trace của F1/F2/F3 nên được gắn bằng overlay dưới đây.
+      - service: ewallet-payment-order
+        http: {method: POST, route: "/api/orders/{orderId}/refund"}
+    overlays:
+      - variant: F4a/F4c
+        reason: Saga đã giữ tiền rồi phải bù trừ — có lời gọi gRPC ReversePayment
+        when_span: {service: ewallet-payment-order, kind: client, grpc: {method: ReversePayment}}
+      - variant: F4b
+        reason: Business từ chối ngay ở S2, chưa giữ tiền nên không có bước bù trừ
+        when_span: {service: ewallet-payment-order, kind: server, http: {route: /api/orders, status: 422}}
+
+  - code: F5
+    slug: async-notification
+    title: Thông báo bất đồng bộ
+    entries:
+      - service: ewallet-notification
+        http: {method: GET, route: /api/notifications}    # khách đọc lại danh sách thông báo
+      - service: ewallet-notification                     # trace chỉ có consumer (retry chạy riêng)
+        kafka: {topic: ewallet.payment.events, operation: process}
+    overlays:
+      - variant: consume
+        reason: Đuôi bất đồng bộ của giao dịch chạy trong chính trace này
+        when_span: {kind: consumer, kafka: {topic: ewallet.payment.events, operation: process}}
+      - variant: dead-letter
+        reason: Có event bị đẩy sang dead letter topic
+        when_span: {kafka: {topic: ewallet.payment.events.DLT}}
+
+  - code: F6
+    slug: transaction-history
+    title: Tra cứu lịch sử giao dịch
+    entries:
+      - service: ewallet-business-customer-mobileapp
+        http: {method: GET, route: /api/wallet/transactions}
+      - service: ewallet-business-customer-mobileapp
+        http: {method: GET, route: "/api/wallet/orders/{orderId}"}
+      - service: ewallet-payment-order
+        http: {method: GET, route: /api/orders/history}
+      - service: ewallet-payment-order
+        http: {method: GET, route: "/api/orders/{orderId}"}

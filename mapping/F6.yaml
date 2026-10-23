@@ -1,0 +1,154 @@
+# F6 — Tra cứu lịch sử giao dịch: ánh xạ BƯỚC TÀI LIỆU -> DẤU VẾT TRONG TRACE.
+#
+# Mỗi khoá dưới `steps` là số thứ tự bước ở bảng §2.3 của trang Confluence
+# "[F6] Tra cứu lịch sử giao dịch". Cú pháp matcher: xem chú thích đầu mapping/F1.yaml.
+#
+# ĐẶC THÙ: đây là flow CHỈ ĐỌC, không có saga, không có event. Giá trị của nó với v-quality nằm ở
+# chỗ khác: bước 5 và NFR-DB-01 biến khái niệm mơ hồ "N+1 query" thành hai thứ đếm được —
+#   - bước 5: `max_count: 1` (tài liệu đòi lấy order_steps của MỌI đơn bằng MỘT truy vấn IN/JOIN);
+#   - NFR-DB-01: tổng số câu SQL của payment-order trong một lần gọi phải ≤ 2.
+# Vượt trần thì bước thành PARTIAL (dấu vết vẫn có, chỉ là sai cách) chứ không phải MISSING.
+
+flow: F6
+version: 1
+title: Tra cứu lịch sử giao dịch
+doc_section: "§2.3 Mô tả chi tiết nghiệp vụ"
+
+segments:
+  - id: list-bff
+    label: Khách tra cứu lịch sử qua app
+    when:
+      - {service: ewallet-business-customer-mobileapp, kind: server, http: {route: /api/wallet/transactions}}
+    steps: ["1", "2", "3", "4", "5", "6", "7"]
+
+  - id: list-internal
+    label: Ops gọi thẳng route nội bộ /api/orders/history
+    when:
+      - {service: ewallet-payment-order, kind: server, http: {route: /api/orders/history}}
+    steps: ["4", "5", "6"]
+    note: >-
+      §2.4 E5: Ops gọi thẳng route nội bộ nên không đi qua BFF — các bước của BFF (1, 2, 3, 7)
+      không có trong trace này và không phải là thiếu.
+
+  - id: detail
+    label: Tra cứu một đơn cụ thể
+    when:
+      - {service: ewallet-business-customer-mobileapp, kind: server, http: {route: "/api/wallet/orders/{orderId}"}}
+      - {service: ewallet-payment-order, kind: server, http: {route: "/api/orders/{orderId}"}}
+    steps: []
+    note: >-
+      Tra cứu một đơn theo id là endpoint của F6 nhưng KHÔNG có trong bảng §2.3 (bảng đó chỉ mô tả
+      danh sách lịch sử). Không có bước nào để đối chiếu — cần bổ sung tài liệu nếu muốn kiểm.
+
+# --- Nhánh nghiệp vụ theo §2.4 ---
+outcome:
+  from:
+    - service: ewallet-payment-order
+      kind: server
+      http: {route: /api/orders/history}
+    - service: ewallet-business-customer-mobileapp
+      kind: server
+      http: {route: /api/wallet/transactions}
+  branches:
+    "200":
+      code: OK
+      label: Trả danh sách (có thể rỗng nếu khách chưa giao dịch — §2.4 E1)
+    "400":
+      code: MISSING_PARAMETER
+      label: Thiếu customerId — BFF từ chối trước khi gọi order
+      doc_ref: "§2.4 E2"
+      stop_after_step: 3
+
+# --- Điểm đo NFR (§4) ---
+nfr:
+  NFR-LAT-04:
+    point: >-
+      Thời gian xử lý tại ewallet-payment-order cho GET /api/orders/history — điểm chung của cả
+      hai đoạn (qua app và gọi thẳng route nội bộ); gateway/BFF chỉ chuyển tiếp.
+    measure:
+      service: ewallet-payment-order
+      kind: server
+      http: {route: /api/orders/history}
+  NFR-DB-01:
+    point: >-
+      Tổng số câu SQL mà ewallet-payment-order chạy trong một lần tra cứu. Đây là NFR đặc thù cho
+      database-quality-library: nó biến "N+1" thành một ngưỡng đếm được (R-HIST-06 yêu cầu 1 truy
+      vấn đơn + 1 truy vấn bước = 2).
+    metric: db_query_count
+    of:
+      service: ewallet-payment-order
+  NFR-DB-02:
+    point: Câu SQL chậm nhất của ewallet-payment-order trong lần tra cứu này
+    measure:
+      service: ewallet-payment-order
+      type: db
+
+# --- 7 bước của §2.3 ---
+steps:
+  "1":
+    evidence:
+      - service: ewallet-gateway
+        kind: server
+        http: {method: GET, path: /api/wallet/transactions}
+        label: HTTP GET /api/wallet/transactions tại gateway
+    note: customerId và limit nằm ở query string; OTel không ghi query nên chỉ chứng minh được lời gọi.
+
+  "2":
+    evidence:
+      - service: ewallet-gateway
+        kind: client
+        http: {peer: ewallet-business-customer-mobileapp}
+        label: Gateway chuyển tiếp sang BFF
+
+  "3":
+    evidence:
+      - service: ewallet-business-customer-mobileapp
+        kind: client
+        http: {peer: ewallet-payment-order}
+        label: BFF gọi GET /api/orders/history
+      - service: ewallet-payment-order
+        kind: server
+        http: {method: GET, route: /api/orders/history}
+        label: payment-order nhận yêu cầu tra cứu
+    note: R-HIST-03 (kẹp limit về tối đa 100) chạy trong bộ nhớ, giá trị limit không có trong span.
+
+  "4":
+    evidence:
+      - service: ewallet-payment-order
+        db: {op: SELECT, table: payment_orders}
+        max_count: 1
+        label: Đúng MỘT truy vấn payment_orders theo customer_id (R-HIST-01, R-HIST-02)
+    note: >-
+      Thứ tự created_at DESC và giới hạn limit nằm trong câu lệnh SQL; matcher `sql_contains` đọc
+      được db.statement nếu cần kiểm chặt hơn.
+
+  "5":
+    evidence:
+      - service: ewallet-payment-order
+        db: {op: SELECT, table: order_steps}
+        max_count: 1
+        label: Đúng MỘT truy vấn order_steps cho tất cả đơn — IN hoặc JOIN (R-HIST-05, R-HIST-06)
+    note: >-
+      Trần 1 lần chính là chỗ N+1 lộ ra: mỗi đơn một câu SELECT thì số lần bằng số đơn trả về.
+      Bước khi đó là PARTIAL — dấu vết vẫn có, chỉ là không đúng cách tài liệu yêu cầu.
+
+  "6":
+    observable: false
+    reason: >-
+      Gộp kết quả theo order_id chạy trong bộ nhớ, không sinh span. Bằng chứng gián tiếp là sau
+      truy vấn order_steps không còn truy vấn nào nữa mà response đã trả về.
+    anchor:
+      service: ewallet-payment-order
+      kind: server
+      http: {route: /api/orders/history}
+      label: Span SERVER của payment-order
+
+  "7":
+    evidence:
+      - service: ewallet-business-customer-mobileapp
+        kind: server
+        http: {route: /api/wallet/transactions, status: 200}
+        label: BFF trả HTTP 200 cho client
+    note: >-
+      R-HIST-04 (ẩn trường nội bộ) nằm ở nội dung body, trace không kiểm được. Chỉ so sánh body
+      của route khách hàng với route nội bộ mới kết luận được — việc của kiểm thử hợp đồng.

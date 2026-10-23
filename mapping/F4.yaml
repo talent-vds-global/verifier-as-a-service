@@ -1,0 +1,251 @@
+# F4 — Giao dịch lỗi và hoàn tiền (compensation): ánh xạ BƯỚC TÀI LIỆU -> DẤU VẾT TRONG TRACE.
+#
+# Mỗi khoá dưới `steps` là số thứ tự bước ở bảng §2.4 của trang Confluence
+# "[F4] Giao dịch lỗi và hoàn tiền" (bảng mô tả luồng F4a). Cú pháp matcher: xem mapping/F1.yaml.
+#
+# ĐẶC THÙ: F4 hiếm khi là flow chính của một trace.
+#   F4a/F4c — bù trừ xảy ra BÊN TRONG trace của F1/F2/F3 (đơn đã giữ tiền rồi bước sau hỏng).
+#             Trace đó vẫn được nhận diện là F1/F2/F3, kèm **nhãn phụ** F4 (flow-map.yaml).
+#             Muốn soi riêng phần bù trừ thì chạy mapping này trên chính trace ấy:
+#                 python -m analysis.check_mapping F4 <trace_id_cua_F1>
+#   F4b     — business từ chối ngay ở S2, CHƯA giữ tiền nên không có bước bù trừ nào. Nhánh này
+#             không dùng mapping F4; nó là nhánh REJECTED của chính F1/F2/F3.
+#   F4d     — Ops chủ động hoàn tiền: POST /api/orders/{orderId}/refund, là trace riêng.
+# Khối `segments` tách hai đoạn đó ra.
+
+flow: F4
+version: 1
+title: Giao dịch lỗi và hoàn tiền
+doc_section: "§2.4 Mô tả chi tiết nghiệp vụ (luồng F4a)"
+
+segments:
+  - id: F4d
+    label: F4d — Ops chủ động hoàn tiền một đơn đã COMPLETED
+    when:
+      - {service: ewallet-payment-order, kind: server, http: {route: "/api/orders/{orderId}/refund"}}
+    # Bước 1–7 là phần "giao dịch gốc hỏng" — F4d không có, vì đơn đã hoàn tất từ trước ở
+    # một trace khác. Bước 12 là "trả 502": F4d thành công nên trả 200.
+    steps: ["8", "9", "10", "11", "13"]
+    note: >-
+      Bước này thuộc phần giao dịch gốc thất bại (F4a). Ở F4d, đơn đã COMPLETED từ một lần gọi
+      trước nên phần đó nằm ở trace khác.
+
+  - id: F4a
+    label: F4a/F4c — saga tự bù trừ sau khi đã giữ tiền
+    when:
+      - {service: ewallet-payment-order, kind: client, grpc: {method: ReversePayment}}
+    steps: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13"]
+
+# --- Nhánh nghiệp vụ ---
+# Hai cửa vào: F4a đọc mã của POST /api/orders (502/504), F4d đọc mã của .../refund.
+outcome:
+  from:
+    - service: ewallet-payment-order
+      kind: server
+      http: {route: /api/orders}
+    - service: ewallet-payment-order
+      kind: server
+      http: {route: "/api/orders/{orderId}/refund"}
+  branches:
+    "200":
+      code: REFUNDED
+      label: Hoàn tiền xong (F4d — Ops hoàn tiền chủ động)
+    "409":
+      code: ALREADY_REFUNDED
+      label: Đơn đã hoàn tiền trước đó — R-COMP-06 chặn hoàn lần hai
+      doc_ref: "§2.5 D4-3"
+      stop_after_step: 7
+    "502":
+      code: PARTNER_DECLINED_OR_CONFIRM_FAILED
+      label: Đối tác từ chối hoặc S4 lỗi — đã bù trừ, đơn về REFUNDED
+      doc_ref: "§2.4 F4a/F4c"
+    "504":
+      code: PARTNER_TIMEOUT
+      label: Đối tác không phản hồi — đã bù trừ, đơn về REFUNDED (R-COMP-08)
+      doc_ref: "§2.4 F4a"
+
+# --- Điểm đo NFR (§4) ---
+nfr:
+  NFR-COMP-01:
+    point: >-
+      Từ lúc lời gọi đối tác kết thúc (partner trả lỗi) tới lúc bù trừ xong — đo bằng khoảng cách
+      giữa span ExecutePartnerPayment và span ReversePayment phía ewallet-payment-order.
+    metric: elapsed_between
+    from: {service: ewallet-payment-order, kind: client, grpc: {method: ExecutePartnerPayment}}
+    from_edge: end
+    to: {service: ewallet-payment-order, kind: client, grpc: {method: ReversePayment}}
+    to_edge: end
+  NFR-COMP-02:
+    point: >-
+      Tỉ lệ bù trừ thất bại (COMPENSATION_FAILED) trên tổng số lần bù trừ — là số liệu cộng dồn
+      nhiều trace, một trace đơn lẻ không đo được. Dấu hiệu trong trace này là span ReversePayment
+      có lỗi; xem bước 9.
+  NFR-TIMEOUT-01:
+    point: Lời gọi HTTP từ ewallet-third-party sang partner-sim
+    measure:
+      service: ewallet-third-party
+      kind: client
+      http: {peer: partner-sim}
+
+# --- 13 bước của §2.4 (luồng F4a) ---
+steps:
+  "1":
+    evidence:
+      - service: ewallet-payment-order
+        kind: server
+        http: {method: POST, route: /api/orders}
+        label: HTTP POST /api/orders (đơn đã được tạo)
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: AuthorizePayment}
+        label: gRPC AuthorizePayment — S2 chạy xong, tiền đã giữ
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: ledger_entries}
+        min_count: 2
+        label: INSERT bút toán ledger_entries PENDING (tiền đã bị giữ)
+    note: >-
+      Tài liệu gộp "bước 1–8 giống F1" thành một dòng. Điều kiện để nhánh bù trừ có nghĩa là tiền
+      ĐÃ bị giữ — nếu chưa có bút toán PENDING thì đây là F4b, không phải F4a.
+
+  "2":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: ExecutePartnerPayment}
+        label: gRPC ExecutePartnerPayment (S3, phía gọi)
+
+  "3":
+    evidence:
+      - service: ewallet-payment-business
+        kind: client
+        http: {peer: ewallet-third-party}
+        label: Business gọi POST /api/thirdparty/execute
+      - service: ewallet-third-party
+        kind: client
+        http: {peer: partner-sim}
+        label: third-party gọi partner-sim
+
+  "4":
+    evidence:
+      - service: partner-sim
+        kind: server
+        http: {method: POST, route: "/partner/{code}/execute"}
+        label: partner-sim xử lý và trả kết quả
+    note: >-
+      Kết quả DECLINED nằm trong body, không có trong thuộc tính span — partner-sim vẫn trả HTTP
+      200. Dấu vết quan sát được của việc "bị từ chối" là có bước bù trừ phía sau.
+
+  "5":
+    evidence:
+      - service: ewallet-third-party
+        db: {op: UPDATE, table: partner_transactions}
+        label: UPDATE partner_transactions = FAILED
+    note: Giá trị fail_reason nằm trong tham số câu lệnh, không đọc được từ thuộc tính span.
+
+  "6":
+    evidence:
+      - service: ewallet-payment-business
+        kind: server
+        grpc: {method: ExecutePartnerPayment}
+        label: gRPC ExecutePartnerPayment (phía xử lý)
+      - service: ewallet-payment-business
+        kind: client
+        grpc: {method: ReversePayment}
+        min_count: 0
+        max_count: 0
+        label: Business KHÔNG được tự gọi bù trừ (R-COMP-01 — việc đó là của orchestrator)
+    note: >-
+      R-COMP-01 quy trách nhiệm bù trừ cho orchestrator. Matcher trần biến điều đó thành thứ kiểm
+      được: thấy business tự gọi ReversePayment là vi phạm phân vai, dễ dẫn tới bù trừ hai lần.
+
+  "7":
+    evidence:
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: order_steps}
+        label: INSERT order_steps (ghi bước PARTNER_EXECUTE = FAILED)
+      - service: ewallet-payment-order
+        db: {op: UPDATE, table: payment_orders}
+        label: UPDATE payment_orders sang COMPENSATING
+
+  "8":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: ReversePayment}
+        label: gRPC ReversePayment (S3', phía gọi — R-COMP-05)
+
+  "9":
+    evidence:
+      - service: ewallet-payment-business
+        kind: server
+        grpc: {method: ReversePayment}
+        label: gRPC ReversePayment (phía xử lý)
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: ledger_entries}
+        min_count: 2
+        label: INSERT bút toán ngược chiều với txn_id mới (R-LEDGER-02)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: ledger_entries}
+        min_count: 2
+        label: UPDATE bút toán gốc sang REVERSED (không sửa nội dung — sổ cái append-only)
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: payment_transactions}
+        label: INSERT payment_transactions mới loại REFUND (R-COMP-03, R-FEE-05)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: payment_transactions}
+        label: UPDATE transaction gốc sang REVERSED (R-COMP-02)
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: daily_usage}
+        label: Trả lại hạn mức ngày (R-USAGE-02)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: account_balances}
+        optional: true
+        label: Hoàn số dư — chỉ chạy khi bút toán gốc đã POSTED
+    note: >-
+      Số dư chỉ được hoàn nếu bút toán gốc đã POSTED. Đơn hỏng ở S3 mới chỉ có bút toán PENDING
+      nên số dư chưa từng đổi, không có UPDATE account_balances — vì vậy matcher đó là optional.
+
+  "10":
+    evidence:
+      - service: ewallet-payment-business
+        kafka: {topic: ewallet.payment.events, operation: publish}
+        label: Kafka publish ewallet.payment.events (R-EVENT-01)
+    note: Tên event (PaymentRefunded) không nằm trong thuộc tính span, chỉ thấy topic.
+
+  "11":
+    evidence:
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: order_steps}
+        label: INSERT order_steps (ghi bước COMPENSATE = COMPENSATED)
+      - service: ewallet-payment-order
+        db: {op: UPDATE, table: payment_orders}
+        label: UPDATE payment_orders sang REFUNDED
+
+  "12":
+    require: any
+    evidence:
+      - service: ewallet-payment-order
+        kind: server
+        http: {route: /api/orders, status: 502}
+        label: Trả HTTP 502 PARTNER_DECLINED (R-COMP-08)
+      - service: ewallet-payment-order
+        kind: server
+        http: {route: /api/orders, status: 504}
+        label: Trả HTTP 504 PARTNER_TIMEOUT (R-COMP-08)
+    note: >-
+      R-COMP-08 phân biệt từ chối (502) với hết giờ (504); trường refunded trong body không có
+      trong thuộc tính span. require=any vì một trace chỉ đi một trong hai nhánh.
+
+  "13":
+    severity: must
+    evidence:
+      - service: ewallet-notification
+        kafka: {topic: ewallet.payment.events, operation: process}
+        label: notification-cg nhận event hoàn tiền
+      - service: ewallet-notification
+        db: {op: INSERT, table: notification_outbox}
+        label: INSERT notification_outbox (R-NOTIF-01 — báo khách đã hoàn tiền)
+      - service: ewallet-payment-order
+        kafka: {topic: ewallet.payment.events, operation: process}
+        label: order-status-cg nhận event
+    note: Đuôi bất đồng bộ — client đã nhận phản hồi lỗi trước bước này.

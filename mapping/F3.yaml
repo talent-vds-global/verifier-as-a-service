@@ -1,0 +1,285 @@
+# F3 — Chuyển tiền P2P giữa hai ví: ánh xạ BƯỚC TRONG TÀI LIỆU -> DẤU VẾT TRONG TRACE.
+#
+# Mỗi khoá dưới `steps` là số thứ tự bước ở bảng §2.3 của trang Confluence
+# "[F3] Chuyển tiền P2P giữa hai ví". Cú pháp matcher: xem chú thích đầu mapping/F1.yaml.
+#
+# Đặc thù so với F1/F2: KHÔNG có hop ra ngoài hệ thống. Bước 7 của tài liệu nói rõ saga bỏ qua
+# S3 PARTNER_EXECUTE vì partnerCode rỗng — đây là bước mà "đúng" nghĩa là KHÔNG có dấu vết,
+# nên nó dùng matcher trần `max_count: 0` thay vì matcher tìm span.
+#
+# Kiểm bằng:  python -m analysis.check_mapping F3 <trace_id>
+
+flow: F3
+version: 1
+title: Chuyển tiền P2P giữa hai ví
+doc_section: "§2.3 Mô tả chi tiết nghiệp vụ"
+
+# --- Nhánh nghiệp vụ theo §2.4 ---
+outcome:
+  from:
+    service: ewallet-payment-order
+    kind: server
+    http: {route: /api/orders}
+  branches:
+    "200":
+      code: COMPLETED
+      label: Chuyển tiền thành công, số dư hai ví đã cập nhật
+    "202":
+      code: HELD
+      label: Số tiền ≥ 20 triệu, giữ tiền chờ duyệt — saga dừng ở S2
+      doc_ref: "§2.4 C7"
+      stop_after_step: 6
+      expect_extra:
+        - id: C7.1
+          label: Business publish event PaymentHeld lên ewallet.payment.events
+          doc_ref: "§2.4 C7 + R-EVENT-01"
+          service: ewallet-payment-business
+          rules: [R-REVIEW-01, R-EVENT-01]
+          evidence:
+            - service: ewallet-payment-business
+              kafka: {topic: ewallet.payment.events, operation: publish}
+              label: Kafka publish ewallet.payment.events
+    "409":
+      code: DUPLICATE_REQUEST
+      label: Trùng idempotency key với payload khác (R-IDEM-03)
+      stop_after_step: 4
+    "422":
+      code: REJECTED
+      label: Vi phạm business rule — business từ chối ở S2, chưa giữ tiền
+      doc_ref: "§2.4 C1–C6"
+      # Dừng ở 5: bước 6 mô tả việc ghi sổ giữ tiền, nhánh từ chối không đi tới đó.
+      stop_after_step: 5
+      expect_extra:
+        - id: C4.1
+          label: Business ghi transaction REJECTED và KHÔNG ghi bút toán nào
+          doc_ref: "§2.4 C1–C6"
+          service: ewallet-payment-business
+          rules: [R-BALANCE-01, R-LEDGER-01]
+          evidence:
+            - service: ewallet-payment-business
+              db: {op: SELECT, table: accounts}
+              min_count: 2
+              label: SELECT accounts ≥2 lần (phải kiểm cả ví gửi lẫn ví nhận — R-ACCOUNT-01)
+            - service: ewallet-payment-business
+              db: {op: INSERT, table: payment_transactions}
+              label: INSERT payment_transactions (trạng thái REJECTED)
+            - service: ewallet-payment-business
+              db: {op: INSERT, table: ledger_entries}
+              min_count: 0
+              max_count: 0
+              label: Không được có dòng ledger_entries nào
+        - id: C4.2
+          label: Business publish event PaymentFailed
+          doc_ref: "§2.4 C1–C6 + R-EVENT-01"
+          service: ewallet-payment-business
+          rules: [R-EVENT-01]
+          evidence:
+            - service: ewallet-payment-business
+              kafka: {topic: ewallet.payment.events, operation: publish}
+              label: Kafka publish ewallet.payment.events
+    "502":
+      code: CONFIRM_FAILED
+      label: S4 lỗi sau khi đã giữ tiền — vào nhánh bù trừ F4 (§2.4 C9)
+      doc_ref: "§2.4 C9"
+      stop_after_step: 8
+
+# --- Điểm đo NFR (§4) ---
+nfr:
+  NFR-LAT-01:
+    point: Span gRPC AuthorizePayment phía ewallet-payment-business
+    measure:
+      service: ewallet-payment-business
+      kind: server
+      grpc: {method: AuthorizePayment}
+  NFR-LAT-03:
+    point: >-
+      End-to-end tại ewallet-gateway cho POST /api/wallet/transfer. Ngưỡng chặt hơn F1/F2
+      (800ms so với 2000ms) vì F3 không có hop ra ngoài hệ thống.
+    measure:
+      service: ewallet-gateway
+      kind: server
+      http: {method: POST, path: /api/wallet/transfer}
+  NFR-ERR-01:
+    metric: error_rate_in_trace
+    # Mã 4xx ở đây là kết cục nghiệp vụ đã khai trong §2.4 (C1–C6), không phải lỗi hệ thống.
+    # Không loại ra thì mọi giao dịch bị từ chối ĐÚNG LUẬT đều đẩy error_rate lên 50% và sinh
+    # cảnh báo giả — mã 5xx vẫn được tính đủ.
+    ignore_status: [400, 404, 409, 422]
+
+# --- 11 bước của §2.3 ---
+steps:
+  "1":
+    evidence:
+      - service: ewallet-gateway
+        kind: server
+        http: {method: POST, path: /api/wallet/transfer}
+        label: HTTP POST /api/wallet/transfer tại gateway
+    note: Header X-Idempotency-Key (R-IDEM-01) không được OTel ghi lại nên chỉ chứng minh được lời gọi.
+
+  "2":
+    observable: false
+    reason: >-
+      BFF chặn sớm R-P2P-01 (tự chuyển cho mình) và kiểm amount ngay trong bộ nhớ, không sinh span.
+      Bằng chứng gián tiếp: request đi tiếp được xuống POST /api/orders. Nếu BFF từ chối thì trace
+      dừng ngay tại span SERVER này với mã 422 và không có bước 3 trở đi.
+    anchor:
+      service: ewallet-business-customer-mobileapp
+      kind: server
+      http: {route: /api/wallet/transfer}
+      label: Span SERVER của BFF
+
+  "3":
+    evidence:
+      - service: ewallet-business-customer-mobileapp
+        kind: client
+        http: {peer: ewallet-payment-order}
+        label: BFF gọi POST /api/orders
+    note: paymentType=P2P nằm trong body, không có trong thuộc tính span.
+
+  "4":
+    evidence:
+      - service: ewallet-payment-order
+        kind: server
+        http: {method: POST, route: /api/orders}
+        label: HTTP POST /api/orders tới payment-order
+      - service: ewallet-payment-order
+        db: {op: SELECT, table: payment_orders}
+        label: SELECT payment_orders (kiểm tra idempotency — R-IDEM-02)
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: payment_orders}
+        label: INSERT payment_orders (trạng thái CREATED)
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: order_steps}
+        label: INSERT order_steps (ghi bước CREATE_ORDER)
+    note: Giá trị dest_customer_id nằm trong tham số câu lệnh, không đọc được từ thuộc tính span.
+
+  "5":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: AuthorizePayment}
+        label: gRPC AuthorizePayment (phía gọi)
+      - service: ewallet-payment-order
+        db: {op: UPDATE, table: payment_orders}
+        label: UPDATE payment_orders sang AUTHORIZING
+
+  "6":
+    evidence:
+      - service: ewallet-payment-business
+        kind: server
+        grpc: {method: AuthorizePayment}
+        label: gRPC AuthorizePayment (phía xử lý)
+      - service: ewallet-payment-business
+        db: {op: SELECT, table: accounts}
+        min_count: 2
+        label: SELECT accounts ≥2 lần — ví gửi và ví nhận (R-ACCOUNT-01, R-ACCOUNT-02, R-P2P-01)
+      - service: ewallet-payment-business
+        db: {op: SELECT, table: limit_config}
+        label: SELECT limit_config (R-LIMIT-01)
+      - service: ewallet-payment-business
+        db: {op: SELECT, table: daily_usage}
+        label: SELECT daily_usage (R-LIMIT-01 — tổng đã dùng trong ngày)
+      - service: ewallet-payment-business
+        db: {op: SELECT, table: account_balances}
+        label: SELECT account_balances (R-BALANCE-01 — số dư phải đủ cả phí)
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: payment_transactions}
+        label: INSERT payment_transactions
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: ledger_entries}
+        min_count: 2
+        label: INSERT bút toán ledger_entries PENDING (R-LEDGER-01)
+      - service: ewallet-payment-business
+        db: {op: INSERT, table: daily_usage}
+        label: Cộng daily_usage của người gửi (R-USAGE-01)
+    note: >-
+      Số lần SELECT accounts là dấu hiệu quan sát được của R-P2P-01/R-ACCOUNT: chỉ đọc một ví
+      nghĩa là ví người nhận chưa từng được kiểm tra. Phí P2P (R-FEE-04) chỉ phát sinh khi số tiền
+      trên 2 triệu nên số dòng ledger là 2 hoặc 4 — mapping đặt sàn 2.
+
+  "7":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: ExecutePartnerPayment}
+        min_count: 0
+        max_count: 0
+        label: KHÔNG được gọi ExecutePartnerPayment (R-P2P-02 — partnerCode rỗng)
+      - service: ewallet-third-party
+        min_count: 0
+        max_count: 0
+        label: KHÔNG được có span nào của ewallet-third-party
+    note: >-
+      Bước duy nhất mà "đúng" nghĩa là không có dấu vết. Matcher trần `max_count: 0` biến mệnh đề
+      phủ định của tài liệu thành thứ kiểm được: thấy span tức là saga đã gọi đối tác cho một giao
+      dịch nội bộ, tiền có nguy cơ ra khỏi hệ thống.
+
+  "8":
+    evidence:
+      - service: ewallet-payment-order
+        kind: client
+        grpc: {method: ConfirmPayment}
+        label: gRPC ConfirmPayment (phía gọi)
+      - service: ewallet-payment-business
+        kind: server
+        grpc: {method: ConfirmPayment}
+        label: gRPC ConfirmPayment (phía xử lý)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: ledger_entries}
+        min_count: 2
+        label: UPDATE bút toán ledger sang POSTED (R-LEDGER-01)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: account_balances}
+        min_count: 2
+        label: UPDATE account_balances 2 lần — trừ ví gửi, cộng ví nhận (R-P2P-06, R-P2P-07)
+      - service: ewallet-payment-business
+        db: {op: UPDATE, table: payment_transactions}
+        label: UPDATE payment_transactions sang CAPTURED
+    note: >-
+      R-P2P-07 yêu cầu khoá hai ví theo thứ tự account_id tăng dần để tránh deadlock; thứ tự khoá
+      không nằm trong thuộc tính span nên trace chỉ chứng minh được là cả hai số dư đều đã đổi.
+
+  "9":
+    evidence:
+      - service: ewallet-payment-business
+        kafka: {topic: ewallet.payment.events, operation: publish}
+        label: Kafka publish ewallet.payment.events (R-EVENT-01)
+    note: Trường counterpartyCustomerId nằm trong payload event, không có trong thuộc tính span.
+
+  "10":
+    evidence:
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: order_steps}
+        label: INSERT order_steps (ghi bước CONFIRM)
+      - service: ewallet-payment-order
+        db: {op: UPDATE, table: payment_orders}
+        label: UPDATE payment_orders sang COMPLETED
+      - service: ewallet-payment-order
+        kind: server
+        http: {route: /api/orders, status: 200}
+        label: Trả HTTP 200 về BFF
+      - service: ewallet-business-customer-mobileapp
+        kind: server
+        http: {route: /api/wallet/transfer, status: 200}
+        optional: true
+        label: BFF trả HTTP 200 cho client
+
+  "11":
+    severity: must
+    evidence:
+      - service: ewallet-notification
+        kafka: {topic: ewallet.payment.events, operation: process}
+        label: notification-cg nhận event
+      - service: ewallet-notification
+        db: {op: INSERT, table: notification_outbox}
+        min_count: 2
+        label: INSERT notification_outbox ≥2 dòng — báo cả người gửi lẫn người nhận (R-P2P-04)
+      - service: ewallet-payment-order
+        kafka: {topic: ewallet.payment.events, operation: process}
+        label: order-status-cg nhận event
+      - service: ewallet-payment-order
+        db: {op: INSERT, table: order_steps}
+        label: INSERT order_steps EVENT_APPLIED (R-ORDST-03)
+    note: >-
+      Đuôi bất đồng bộ — client đã nhận phản hồi trước bước này. R-P2P-04 (người nhận cũng phải
+      được báo) quan sát được qua SỐ DÒNG outbox, vì customerId nằm trong tham số câu lệnh.

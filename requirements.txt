@@ -1,0 +1,11 @@
+flask
+google-genai
+psycopg2-binary
+requests
+python-dotenv
+html2text
+flask-cors
+beautifulsoup4
+pyyaml
+openai
+tzdata
